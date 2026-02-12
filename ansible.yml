@@ -1,0 +1,116 @@
+---
+- name: Подготовка репозиториев для всех хостов
+  hosts: all
+  become: yes
+  tasks:
+    - name: Установка EPEL и Zabbix Repo
+      yum:
+        name:
+          - https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+          - https://repo.zabbix.com/zabbix/6.0/rhel/7/x86_64/zabbix-release-6.0-4.el7.noarch.rpm
+        state: present
+
+- name: Установка и настройка Zabbix Server
+  hosts: zabbix_server
+  become: yes
+  vars:
+    db_pass: "SuperSecretPass"
+    php_memory_limit: "16M" # Твоя настройка
+    timezone: "Europe/Moscow"
+  tasks:
+    - name: Установка Remi PHP 7.4
+      yum:
+        name: https://rpms.remirepo.net/enterprise/remi-release-7.rpm
+        state: present
+
+    - name: Включение PHP 7.4
+      command: yum-config-manager --enable remi-php74
+      args:
+        creates: /etc/yum.repos.d/remi-php74.repo
+
+    - name: Установка пакетов Server, DB и PHP
+      yum:
+        name: [mariadb-server, zabbix-server-mysql, zabbix-web-mysql, zabbix-apache-conf, zabbix-sql-scripts, MySQL-python]
+        state: present
+
+    - name: Настройка MariaDB
+      systemd: { name: mariadb, state: started, enabled: yes }
+
+    - name: Создание базы данных
+      mysql_db: { name: zabbix, encoding: utf8mb4, collation: utf8mb4_bin, state: present }
+      mysql_user: { name: zabbix, password: "{{ db_pass }}", priv: "zabbix.*:ALL", state: present }
+
+    - name: Импорт схемы данных (проверка по наличию таблиц)
+      shell: "zcat /usr/share/doc/zabbix-sql-scripts/mysql/server.sql.gz | mysql -uzabbix -p{{ db_pass }} zabbix"
+      when: "(mysql_db.changed)" # Импортируем только если база только что создана
+
+    - name: Конфигурация zabbix_server.conf
+      lineinfile:
+        path: /etc/zabbix/zabbix_server.conf
+        regexp: '^# DBPassword='
+        line: "DBPassword={{ db_pass }}"
+
+    - name: Тюнинг PHP
+      lineinfile:
+        path: /etc/opt/rh/rh-php74/php-fpm.d/zabbix.conf
+        regexp: "{{ item.reg }}"
+        line: "{{ item.line }}"
+      loop:
+        - { reg: 'php_value\[memory_limit\]', line: "php_value[memory_limit] = {{ php_memory_limit }}" }
+        - { reg: 'php_value\[date.timezone\]', line: "php_value[date.timezone] = {{ timezone }}" }
+
+    - name: Настройка Firewalld для Сервера
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop: ['80/tcp', '10051/tcp']
+
+    - name: Запуск сервисов сервера
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop: [zabbix-server, httpd, rh-php74-php-fpm]
+
+- name: Установка и настройка Zabbix Agent (Клиенты)
+  hosts: zabbix_agents
+  become: yes
+  vars:
+    server_ip: "192.168.1.10" # IP твоего Zabbix сервера
+  tasks:
+    - name: Установка Агента
+      yum:
+        name: zabbix-agent
+        state: present
+
+    - name: Настройка конфига агента
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: "{{ item.reg }}"
+        line: "{{ item.line }}"
+      loop:
+        - { reg: '^Server=', line: "Server={{ server_ip }}" }
+        - { reg: '^ServerActive=', line: "ServerActive={{ server_ip }}" }
+        - { reg: '^Hostname=', line: "Hostname={{ ansible_hostname }}" }
+
+    - name: Настройка Firewalld для Агента
+      firewalld:
+        port: 10050/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Настройка SELinux для Агента (разрешаем работу)
+      seboolean:
+        name: zabbix_can_network
+        state: yes
+        persistent: yes
+      ignore_errors: yes
+
+    - name: Запуск Агента
+      systemd:
+        name: zabbix-agent
+        state: restarted
+        enabled: yes
